@@ -8,9 +8,8 @@ Workflow
 2. For each cell length, use LAMMPS' PHONON-package dynamical_matrix command
    to calculate the mass-normalized harmonic Hessian for a slab around one
    transport cross-section. Convert it back to force constants.
-3. Run periodic NEMD with a central hot reservoir and cold reservoirs at both
-   ends. This avoids placing a hot and cold slab next to each other across the
-   periodic boundary.
+3. Run NEMD with periodic transverse directions (x/y), nonperiodic z, fixed
+   atomic end layers, and hot/cold reservoirs near opposite ends.
 4. Compute the spectral heat current across one cross-section from the full
    3x3 interatomic force-constant blocks and the velocity cross spectra.
 5. Normalize by the measured reservoir temperature difference and fit
@@ -51,19 +50,19 @@ POTENTIAL_FILE = os.environ.get("CU_EAM_FILE", "Cu01.eam.alloy")
 LAMMPS_EXECUTABLE = os.environ.get("LAMMPS_EXECUTABLE", "lmp_urc")
 
 N_XY = 4
-NZ_LIST = [24, 32, 40, 48]  # Fast-test lengths; increase for MFP convergence studies.
+NZ_LIST = [24, 32, 40, 48]
 
-DT_PS = 0.001                 # 1 fs, LAMMPS metal time units (ps)
-N_EQUIL_STEPS = 50_000        # 50 ps NVT equilibration at 300 K
-N_NESS_STEPS = 50_000         # 50 ps NEMD steady-state establishment
-N_PROD_STEPS = 200_000        # 200 ps NEMD production
-DUMP_EVERY = 20               # 0.02 ps output interval; Nyquist = 25 THz
-SEGMENT_FRAMES = 2_000        # 40 ps segments; 5 segments for the default run
+DT_PS = 0.001
+N_EQUIL_STEPS = 50_000
+N_NESS_STEPS = 50_000
+N_PROD_STEPS = 200_000
+DUMP_EVERY = 20
+SEGMENT_FRAMES = 2_000
 
 T_HOT = 310.0
 T_COLD = 290.0
 LANGEVIN_DAMP_PS = 0.5
-HESSIAN_DELTA_A = 1.0e-4      # Central finite-difference displacement (Angstrom)
+HESSIAN_DELTA_A = 1.0e-4
 MIN_SAMPLE_HALF_WIDTH_CELLS = 4.0
 
 FREQ_MIN_THz = 0.10
@@ -73,92 +72,93 @@ MIN_FIT_POINTS = 3
 
 KB_EV_PER_K = 8.617333262145e-5
 
-# Thermostat regions in conventional-cell units.
-HOT_HALF_WIDTH_CELLS = 1.0
-COLD_THICKNESS_CELLS = 1.0
+# Longitudinal boundary/reservoir geometry, in conventional FCC unit cells.
+FIXED_THICKNESS_CELLS = 1.0
+RESERVOIR_THICKNESS_CELLS = 2.0
 
 
 # -----------------------------------------------------------------------------
 # EAM setfl metadata
 # -----------------------------------------------------------------------------
 def read_eam_alloy_metadata(path: str) -> Dict[str, float]:
-    """Read mass, lattice constant, and cutoff from a DYNAMO setfl file."""
+    """Read metadata from a LAMMPS DYNAMO EAM/alloy setfl file."""
+
     p = Path(path)
+
     if not p.is_file():
         raise FileNotFoundError(
-            f"EAM potential '{path}' was not found in {Path.cwd()}. "
-            "Place Cu01.eam.alloy in the run directory or set CU_EAM_FILE."
+            f"EAM potential not found: {path}"
         )
 
-    lines = [line.strip() for line in p.read_text(errors="replace").splitlines()]
-    lines = [line for line in lines if line]
-    if len(lines) < 5:
-        raise ValueError(f"'{path}' does not look like an EAM/alloy setfl file.")
+    with open(p, "r") as f:
+        lines = f.readlines()
 
-    # DYNAMO setfl files commonly begin with four comment lines, followed by
-    # the element count and element-name line. Do not assume a fixed number
-    # of comment lines: scan the header for a count/name pair.
-    header = None
-    for idx in range(min(20, len(lines) - 2)):
-        fields = lines[idx].split()
-        if not fields:
-            continue
-        try:
-            candidate_count = int(fields[0])
-        except ValueError:
-            continue
-        if not (1 <= candidate_count <= 20):
-            continue
+    if len(lines) < 6:
+        raise ValueError("EAM file is too short.")
 
-        # Most setfl files put `N_elements element1 ...` on one line.
-        # Also accept files that put the names on the following line.
-        if len(fields) - 1 >= candidate_count:
-            names = fields[1 : 1 + candidate_count]
-            data_line = idx + 1
-        elif idx + 1 < len(lines):
-            names = lines[idx + 1].split()
-            data_line = idx + 2
-        else:
-            continue
+    # Line 4: number of elements and element names
+    element_fields = lines[3].split()
 
-        if len(names) == candidate_count and data_line + 1 < len(lines):
-            header = (idx, candidate_count, names, data_line)
-            break
+    n_elements = int(element_fields[0])
 
-    if header is None:
+    if len(element_fields) < n_elements + 1:
+        raise ValueError("Invalid EAM element header.")
+
+    elements = element_fields[1:n_elements + 1]
+
+    if "Cu" not in elements:
         raise ValueError(
-            f"Could not locate the element-count/name lines in '{path}'. "
-            "Expected a standard DYNAMO EAM/alloy setfl file."
+            f"Copper not found in EAM elements: {elements}"
         )
 
-    header_line, n_elements, element_names, data_line = header
-    # Standard setfl layout: each element has an atomic-data line followed
-    # by a grid/cutoff line. This script uses the first (Cu) element.
-    atomic_fields = lines[data_line].split()
-    grid_fields = lines[data_line + 1].split()
-    if len(atomic_fields) < 4 or len(grid_fields) < 5:
-        raise ValueError(
-            f"Could not read atomic metadata and cutoff from '{path}'. "
-            "The supplied file may use a different EAM format."
-        )
+    # Line 5: density/radial grid information
+    grid_fields = lines[4].split()
 
-    atomic_mass = float(atomic_fields[1])
-    lattice_constant = float(atomic_fields[2])
-    lattice_type = atomic_fields[3].lower()
+    if len(grid_fields) < 5:
+        raise ValueError("Invalid EAM grid header.")
+
+    nrho = int(grid_fields[0])
+    drho = float(grid_fields[1])
+    nr = int(grid_fields[2])
+    dr = float(grid_fields[3])
     cutoff = float(grid_fields[4])
 
-    if element_names[0].lower() not in {"cu", "copper"}:
+    # Find the copper element's metadata line.
+    # Standard setfl stores one metadata line per element.
+    cu_index = elements.index("Cu")
+    metadata_line_index = 5 + cu_index
+
+    metadata_fields = lines[metadata_line_index].split()
+
+    if len(metadata_fields) < 4:
+        raise ValueError("Invalid copper metadata line.")
+
+    atomic_number = int(metadata_fields[0])
+    atomic_mass = float(metadata_fields[1])
+    lattice_constant = float(metadata_fields[2])
+    lattice_type = metadata_fields[3].lower()
+
+    if atomic_number != 29:
         raise ValueError(
-            f"The first element in '{path}' is '{element_names[0]}', not Cu. "
-            "This script is configured for a single-element Cu model."
+            f"Expected Cu atomic number 29, got {atomic_number}"
         )
+
+    if atomic_mass <= 0 or lattice_constant <= 0 or cutoff <= 0:
+        raise ValueError("Invalid EAM metadata values.")
+
     if "fcc" not in lattice_type:
         raise ValueError(
-            f"The EAM file reports lattice type '{atomic_fields[3]}'; this script "
-            "currently assumes an fcc Cu reference lattice."
+            f"Expected FCC copper, got {lattice_type}"
         )
-    if atomic_mass <= 0 or lattice_constant <= 0 or cutoff <= 0:
-        raise ValueError(f"Invalid mass/lattice/cutoff values in '{path}'.")
+
+    print("\nEAM metadata successfully read:")
+    print(f"  Element: Cu")
+    print(f"  Atomic number: {atomic_number}")
+    print(f"  Atomic mass: {atomic_mass:.6f} amu")
+    print(f"  Lattice constant: {lattice_constant:.6f} Angstrom")
+    print(f"  Cutoff: {cutoff:.6f} Angstrom")
+    print(f"  Density grid: {nrho}, spacing: {drho}")
+    print(f"  Radial grid: {nr}, spacing: {dr}")
 
     return {
         "mass": atomic_mass,
@@ -166,52 +166,69 @@ def read_eam_alloy_metadata(path: str) -> Dict[str, float]:
         "cutoff": cutoff,
     }
 
+def get_sample_half_width_cells(
+    cutoff_A: float,
+    a0_A: float
+) -> float:
 
-def get_sample_half_width_cells(cutoff_A: float, a0_A: float) -> float:
-    """Include the full EAM harmonic coupling range across the sampling plane.
-
-    For EAM, force-constant couplings can extend to pairs sharing a neighbor,
-    so the slab is sized from approximately twice the EAM radial cutoff.
-    """
     return max(
         MIN_SAMPLE_HALF_WIDTH_CELLS,
         2.0 * cutoff_A / a0_A + 0.5,
     )
 
 
-def sample_geometry(n_z: int, a0_A: float, half_width_cells: float) -> Dict[str, float]:
-    """Return thermostat/sample bounds and the unthermostatted path length."""
-    z_cut_cells = n_z / 4.0 + 0.25  # Offset avoids cutting through an fcc atomic plane.
+def sample_geometry(
+    n_z: int,
+    a0_A: float,
+    half_width_cells: float
+) -> Dict[str, float]:
+    """Return the one-way NEMD geometry and central IFC sampling slab.
+
+    z layout (in lattice-cell coordinates):
+      fixed | hot reservoir | unthermostatted channel | cold reservoir | fixed
+
+    The fitted transport length is the distance between the inner edges of
+    the two thermostatted reservoirs, not the full box length.
+    """
+    fixed_lo_hi = FIXED_THICKNESS_CELLS
+    hot_lo = fixed_lo_hi
+    hot_hi = hot_lo + RESERVOIR_THICKNESS_CELLS
+    cold_hi = n_z - FIXED_THICKNESS_CELLS
+    cold_lo = cold_hi - RESERVOIR_THICKNESS_CELLS
+
+    z_cut_cells = 0.5 * n_z
     sample_lo = z_cut_cells - half_width_cells
     sample_hi = z_cut_cells + half_width_cells
-    hot_lo = n_z / 2.0 - HOT_HALF_WIDTH_CELLS
-    cold_hi = COLD_THICKNESS_CELLS
 
-    # Keep the harmonic sampling slab out of the thermostat groups.
-    if sample_lo <= cold_hi + 0.05:
+    if sample_lo <= hot_hi + 0.05:
         raise ValueError(
-            f"Nz={n_z}: sampling slab reaches the low-z cold reservoir. "
-            "Increase NZ_LIST or reduce the cross-section sampling slab only "
-            "after checking the EAM interaction range."
+            f"Nz={n_z}: central sampling slab is too close to the hot reservoir. "
+            "Increase NZ_LIST or reduce the sample half-width."
         )
-    if sample_hi >= hot_lo - 0.05:
+    if sample_hi >= cold_lo - 0.05:
         raise ValueError(
-            f"Nz={n_z}: sampling slab reaches the central hot reservoir. "
-            "Increase NZ_LIST or reduce the cross-section sampling slab only "
-            "after checking the EAM interaction range."
+            f"Nz={n_z}: central sampling slab is too close to the cold reservoir. "
+            "Increase NZ_LIST or reduce the sample half-width."
         )
+    if cold_lo <= hot_hi:
+        raise ValueError(f"Nz={n_z}: no unthermostatted transport channel remains.")
 
-    # Distance between the inner faces of the hot and cold thermostat regions.
-    path_length_A = (hot_lo - cold_hi) * a0_A
+    path_length_A = (cold_lo - hot_hi) * a0_A
+
     return {
         "z_cut_cells": z_cut_cells,
         "z_cut_A": z_cut_cells * a0_A,
         "sample_lo_cells": sample_lo,
         "sample_hi_cells": sample_hi,
+        "fixed_lo_hi_cells": fixed_lo_hi,
+        "hot_lo_cells": hot_lo,
+        "hot_hi_cells": hot_hi,
+        "cold_lo_cells": cold_lo,
+        "cold_hi_cells": cold_hi,
+        "fixed_hi_lo_cells": cold_hi,
         "path_length_A": path_length_A,
         "box_length_A": n_z * a0_A,
     }
-
 
 # -----------------------------------------------------------------------------
 # LAMMPS input generation
@@ -276,10 +293,10 @@ def generate_nemd_input(
     temperature_file = f"cu_reservoir_temps_nz{n_z}.dat"
     log_file = f"log.cu_nemd_nz{n_z}.lammps"
 
-    script = f"""# Periodic Cu NEMD: central hot slab, cold slabs at both ends
+    script = f"""# One-way Cu NEMD: fixed ends, hot reservoir at low z, cold at high z
 units           metal
 dimension       3
-boundary        p p p
+boundary        p p f
 atom_style      atomic
 
 lattice         fcc {a0_A:.12g}
@@ -293,33 +310,42 @@ pair_coeff      * * {potential_file} Cu
 neighbor        2.0 bin
 neigh_modify    delay 0 every 1 check yes
 
-# Match the reference coordinates used for the harmonic Hessian calculation.
+# Define disjoint end constraints and reservoirs before minimization so the
+# fixed end layers remain fixed while the mobile atoms relax.
+region          reg_fixed_lo block INF INF INF INF 0.0 {geometry['fixed_lo_hi_cells']:.8f} units lattice
+region          reg_fixed_hi block INF INF INF INF {geometry['fixed_hi_lo_cells']:.8f} {n_z:.8f} units lattice
+region          reg_hot block INF INF INF INF {geometry['hot_lo_cells']:.8f} {geometry['hot_hi_cells']:.8f} units lattice
+region          reg_cold block INF INF INF INF {geometry['cold_lo_cells']:.8f} {geometry['cold_hi_cells']:.8f} units lattice
+region          reg_sample block INF INF INF INF {geometry['sample_lo_cells']:.8f} {geometry['sample_hi_cells']:.8f} units lattice
+
+group           g_fixed_lo region reg_fixed_lo
+group           g_fixed_hi region reg_fixed_hi
+group           g_fixed_raw union g_fixed_lo g_fixed_hi
+group           g_hot region reg_hot
+group           g_cold region reg_cold
+group           g_reservoirs union g_hot g_cold
+group           g_fixed subtract g_fixed_raw g_reservoirs
+group           g_mobile subtract all g_fixed
+group           g_sample region reg_sample
+fix             freeze g_fixed setforce 0.0 0.0 0.0
+
+# Relax mobile atoms while holding the end layers fixed.
 min_style       cg
 minimize        1.0e-12 1.0e-12 10000 100000
 
 timestep        {DT_PS:.8g}
 
-# Define fixed spatial groups before equilibration.
-region          reg_hot block INF INF INF INF {n_z / 2.0 - HOT_HALF_WIDTH_CELLS:.8f} {n_z / 2.0 + HOT_HALF_WIDTH_CELLS:.8f} units lattice
-region          reg_cold_lo block INF INF INF INF 0.0 {COLD_THICKNESS_CELLS:.8f} units lattice
-region          reg_cold_hi block INF INF INF INF {n_z - COLD_THICKNESS_CELLS:.8f} {n_z:.8f} units lattice
-region          reg_sample block INF INF INF INF {geometry['sample_lo_cells']:.8f} {geometry['sample_hi_cells']:.8f} units lattice
-
-group           g_hot region reg_hot
-group           g_cold_lo region reg_cold_lo
-group           g_cold_hi region reg_cold_hi
-group           g_cold union g_cold_lo g_cold_hi
-group           g_sample region reg_sample
-
-velocity        all create 300.0 12345 mom yes rot yes dist gaussian
-fix             equil all nvt temp 300.0 300.0 0.1
+# Fixed atoms are not integrated; mobile atoms (including both baths) are.
+velocity        g_mobile create 300.0 12345 mom yes rot yes dist gaussian
+velocity        g_fixed set 0.0 0.0 0.0
+fix             equil g_mobile nvt temp 300.0 300.0 0.1
 thermo          5000
 thermo_style    custom step temp pe ke etotal pxx pyy pzz
 run             {N_EQUIL_STEPS}
 unfix           equil
 
-# NEMD production: hot in the middle, cold at both periodic ends.
-fix             integrator all nve
+# One hot and one cold Langevin reservoir; heat travels across the channel.
+fix             integrator g_mobile nve
 fix             hot g_hot langevin {T_HOT:.8g} {T_HOT:.8g} {LANGEVIN_DAMP_PS:.8g} 54321 tally yes
 fix             cold g_cold langevin {T_COLD:.8g} {T_COLD:.8g} {LANGEVIN_DAMP_PS:.8g} 98765 tally yes
 compute         t_hot g_hot temp
@@ -327,11 +353,11 @@ compute         t_cold g_cold temp
 thermo          5000
 thermo_style    custom step temp c_t_hot c_t_cold f_hot f_cold
 
-# Establish non-equilibrium steady state before opening the production dump.
+# Establish non-equilibrium steady state before production sampling.
 run             {N_NESS_STEPS}
 print           "PROD_START $(f_hot:%.16g) $(f_cold:%.16g)" file {energy_file} screen no
 
-# Measure the actual reservoir temperature difference during production.
+# Measure actual bath temperatures and velocities in the central IFC slab.
 fix             tempstats all ave/time 100 10 1000 c_t_hot c_t_cold file {temperature_file}
 dump            d_vel g_sample custom {DUMP_EVERY} {dump_file} id vx vy vz
 dump_modify     d_vel sort id format float %20.16g
@@ -536,8 +562,8 @@ def compute_spectral_transmission(
 ) -> Tuple[np.ndarray, np.ndarray, float, int]:
     """Calculate cross-section spectral current using full 3x3 IFC blocks.
 
-    The hot side is the +z side of the selected plane (toward the central hot
-    thermostat); the cold side is the -z side (toward an end cold thermostat).
+    The hot side is the -z side of the selected plane (toward the low-z hot
+    reservoir); the cold side is the +z side (toward the high-z cold reservoir).
     The global sign is oriented so the integrated current is hot-to-cold.
     Frequency-resolved negative contributions are retained.
     """
@@ -546,12 +572,12 @@ def compute_spectral_transmission(
     if len(atom_xyz) != len(atom_ids):
         raise ValueError("Sample coordinate count does not match sample atom IDs.")
 
-    cold_idx = np.flatnonzero(atom_xyz[:, 2] < z_cut_A)
-    hot_idx = np.flatnonzero(atom_xyz[:, 2] > z_cut_A)
+    hot_idx = np.flatnonzero(atom_xyz[:, 2] < z_cut_A)
+    cold_idx = np.flatnonzero(atom_xyz[:, 2] > z_cut_A)
     if len(cold_idx) == 0 or len(hot_idx) == 0:
         raise ValueError("The sampling slab must contain atoms on both sides of z_cut.")
 
-    # Phi[i,alpha,j,beta], i on hot side, j on cold side.
+    # Phi[i,alpha,j,beta], i on low-z hot side, j on high-z cold side.
     phi_hot_cold = phi[np.ix_(hot_idx, np.arange(3), cold_idx, np.arange(3))]
 
     n_frames = velocity_frames.shape[0]
@@ -696,7 +722,7 @@ def save_plots(freqs_thz: np.ndarray, fit_df: pd.DataFrame) -> None:
             va="center",
         )
 
-    ax.set_title("Cu Phonon MFP Spectrum (EAM IFC + Periodic NEMD Fast Test)")
+    ax.set_title("Cu Phonon MFP Spectrum (EAM IFC + One-Way NEMD Fast Test)")
     ax.set_xlabel("Frequency (THz)")
     ax.set_ylabel("Phonon mean free path (nm)")
     ax.set_xlim(FREQ_MIN_THz, FREQ_MAX_THz)
@@ -775,7 +801,7 @@ def main() -> int:
                 flush=True,
             )
 
-        # B. Periodic NEMD trajectory.
+        # B. One-way NEMD trajectory with fixed z end layers.
         nemd_in, vel_file, energy_file, temp_file, log_file = generate_nemd_input(
             n_z, a0, mass, POTENTIAL_FILE, geometry
         )
@@ -796,17 +822,17 @@ def main() -> int:
             delta_t_K=delta_t_measured,
         )
 
-        # One of the two symmetric heat-flow branches carries approximately
-        # half the total energy supplied to the central hot reservoir.
-        branch_power = hot_power_abs / 2.0
-        if branch_power > 0:
-            rel_power_error = abs(spectral_power - branch_power) / branch_power
+        # With one hot end and one cold end, there is one primary transport
+        # path; compare the plane current with the full hot-bath power.
+        hot_reservoir_power = hot_power_abs
+        if hot_reservoir_power > 0:
+            rel_power_error = abs(spectral_power - hot_reservoir_power) / hot_reservoir_power
         else:
             rel_power_error = np.inf
 
         print(f"  measured reservoir DeltaT = {delta_t_measured:.3f} K (target {delta_t_target:.3f} K)")
         print(f"  thermostat energy changes: hot={delta_hot:.6e} eV, cold={delta_cold:.6e} eV")
-        print(f"  branch power from hot bath = {branch_power:.6e} eV/ps")
+        print(f"  hot-reservoir power = {hot_reservoir_power:.6e} eV/ps")
         print(f"  integrated spectral current = {spectral_power:.6e} eV/ps")
         print(f"  spectral/thermostat power relative difference = {rel_power_error:.1%}")
         print(f"  averaged {n_segments} spectral segments from {velocity_frames.shape[0]} frames")
@@ -847,7 +873,7 @@ def main() -> int:
                 "Measured_DeltaT_K": delta_t_measured,
                 "Hot_Energy_Change_eV": delta_hot,
                 "Cold_Energy_Change_eV": delta_cold,
-                "Branch_Power_eV_per_ps": branch_power,
+                "Hot_Reservoir_Power_eV_per_ps": hot_reservoir_power,
                 "Spectral_Power_eV_per_ps": spectral_power,
                 "Power_Relative_Difference": rel_power_error,
                 "Spectral_Segments": n_segments,
