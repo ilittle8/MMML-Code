@@ -17,7 +17,7 @@ module load lammps/02Aug23-mpi
 echo "Starting Fast Multi-Length NEMD Test..."
 
 # Run fast Python test script
-python3 run_cu_mfp_test_fast.py
+python3 run_cu_mfp_test_fast_fixed.py
 
 echo "======================================================"
 echo "Finish Time : $(date)"
